@@ -10,7 +10,7 @@ setup(
     url='https://github.com/lemanyk/netlog',
     download_url='https://github.com/lemanyk/netlog/',
     description='logging stream server written on gevent',
-    author='Gennady Leman',
+    author='lemanyk',
     author_email='lemanyk@gmail.com',
     install_requires=['gevent'],
     license='MIT',
