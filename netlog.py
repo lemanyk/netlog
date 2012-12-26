@@ -4,9 +4,20 @@ from gevent import server, socket, sleep, queue, spawn
 
 class Server(object):
     """
+    server process
+    while started listen specified port for connections
+    after every MAX_COUNT requests flushe to files
+
+    usage:
+        Server('/logs', 5010).start()
+
+    :param path: directory to save logs
+    :param port: tcp port to listen
     """
     BUF_SIZE = 1024 * 4
-    MAX_COUNT = 3
+    MAX_COUNT = 1000        # max lines before flush
+    LIFE_TIME = 30          # count of days for save files
+    TERMINATOR = '\n'
 
     def __init__(self, path, port, host='0.0.0.0'):
         self.path = path
@@ -14,13 +25,22 @@ class Server(object):
         self.host = host
         self.queue = queue.Queue()
 
-    def start(self):
+    def start(self, blocking=True):
+        """
+        start serving
+        :param blocking: if True then code blocked in Server(..).start() line
+        """
         print 'start on %s %s' % (self.host, self.port)
         spawn(self.flusher)
+        spawn(self.rotator)
+        self._start() if blocking else spawn(self._start)
+
+    def _start(self):
         self.server = server.StreamServer((self.host, self.port), self.handle)
         self.server.serve_forever()
 
     def flusher(self):
+        """flusher process, flushe memory data to logs """
         logfiles = {}
         count = 0
 
@@ -29,7 +49,7 @@ class Server(object):
             logfile, action, string = self.queue.get()
             print 'queue', repr(logfile), repr(action), repr(string)
 
-            #
+            # parse message
             log = logfiles.setdefault(logfile, {})
             if action == 'm':
                 count += 1
@@ -46,13 +66,18 @@ class Server(object):
                         os.makedirs(self.path)
                     except OSError:
                         pass
-                    terminator = logitem.get('terminator', '\n')
+                    terminator = logitem.get('terminator', self.TERMINATOR)
                     with open(path, 'a') as f:
-                        f.write(terminator)
                         f.write(terminator.join(logitem['strings']))
+                        f.write(terminator)
 
                 logfiles = {}
                 count = 0
+
+    def rotator(self):
+        """rotation process"""
+        while True:
+            sleep(600)
 
     def handle(self, sock, addr):
         print 'connect with %s %s' % addr
@@ -83,13 +108,34 @@ class Server(object):
 
 class Client(object):
     """
+    client for logger server
+
+    usage:
+        client = Client('127.0.0.1', 5010, 'filename')
+        client.send('qwe asd')
+
+        client.set_terminator('\n----------\n\n')
+        client.send('rty\n fgh')
+
+    :param port: port to connect
+    :param host: host to connect
+    "param filename: file to write
     """
-    def __init__(self, port, host, logfile):
+    def __init__(self, port, host, filename):
         self.sock = socket.socket()
         self.sock.connect((port, host))
-        self.send('f %s' % logfile, True)
+        self.set_filename(filename)
+
+    def set_filename(self, filename):
+        """set name of file or dir to write log strings"""
+        self.send('f %s' % filename, True)
+
+    def set_terminator(self, terminator):
+        """set string, which will be between log strings"""
+        self.send('t %s' % terminator, True)
 
     def send(self, string, control=False):
+        """send string to server for write to log file"""
         if not control:
             string = 'm %s' % string
         string = '%d %s' % (len(string)-2, string)
