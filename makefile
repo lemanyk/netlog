@@ -20,3 +20,4 @@ arch:
 	mkdir -p dist/netlog
 	cp PKGBUILD dist/netlog
 	cd dist; tar -czvf netlog.tar.gz netlog
+	makepkg -g
