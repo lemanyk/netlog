@@ -1,7 +1,7 @@
 logger
 ======
 
-logging server written on gevent
+logging server written on pure python
 
 
 Run log server:
