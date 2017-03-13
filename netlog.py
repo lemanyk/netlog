@@ -4,6 +4,7 @@ import socket
 import asyncore
 import signal
 import gzip
+import multiprocessing
 from datetime import datetime, timedelta
 
 
@@ -78,9 +79,7 @@ class LogServer(object):
     :param lifetime=LIFETIME: maximum days before deleting old logs
     """
 
-    BUF_SIZE = 1024 * 4
-    TERMINATOR = '\n'
-    debug = False
+    PIDFILE = '/var/run/user/%s/netlog.pid' % os.geteuid()
 
     class Server(asyncore.dispatcher):
         """Listen for connections"""
@@ -113,22 +112,43 @@ class LogServer(object):
 
     def __init__(self, host='0.0.0.0', port=7020, logsdir='~/netlog_logs',
                  archive=True, max_lines=1000, lifetime=30,
-                 pidfile=None):
+                 pidfile=PIDFILE):
         self.host = host
         self.port = port
         self.logsdir = os.path.expanduser(logsdir)
         self.archive = archive
         self.max_lines = max_lines
         self.lifetime = lifetime
-        self.pidfile = pidfile or '/var/run/user/%s/netlog.pid' % os.geteuid()
+        self.pidfile = pidfile
         self.open = gzip.open if self.archive else open
 
     def start(self, daemon=True):
-        """Start logging daemon"""
+        """Start logging server"""
+        self._check_unique()
+
         if daemon:
-            self._become_daemon()
-        signal.signal(signal.SIGTERM, self.stop)  # signal 15 (kill)
-        signal.signal(signal.SIGINT, self.stop)   # signal 2 (ctrl+c)
+            multiprocessing.Process(
+                target=lambda s: sys.exit() if os.fork() > 0 else s._start(),
+                args=(self,)
+            ).start()
+        else:
+            self._start()
+
+    def _check_unique(self):
+        """check if logging server is not running"""
+        try:
+            old_pid = int(open(self.pidfile).read())
+            os.getpgid(old_pid)
+            raise Exception('Logging server is already running with pid %d!'
+                            % old_pid)
+        except (OSError, IOError):
+            pass
+
+    def _start(self):
+        signal.signal(signal.SIGTERM, self._stop)   # signal 15 (kill)
+        signal.signal(signal.SIGINT, self._stop)    # signal 2 (ctrl+c)
+
+        open(self.pidfile, 'w').write(str(os.getpid()))
 
         self.logs = {}
         self.count = 0
@@ -136,20 +156,11 @@ class LogServer(object):
         self.server = self.Server(self)
         asyncore.loop()
 
-    def _become_daemon(self):
-        #if os.fork() > 0: sys.exit()
-        #if os.fork() > 0: sys.exit()
-        try:
-            old_pid = int(open(self.pidfile).read())
-            os.getpgid(old_pid)
-            raise Exception('Logger daemon is already running with pid %d!'
-                            % old_pid)
-        except (OSError, IOError):
-            pass
-        with open(self.pidfile, 'w') as f:
-            f.write(str(os.getpid()))
+    def stop(self):
+        """Stop the logging server"""
+        os.kill(int(open(self.pidfile).read()), signal.SIGTERM)
 
-    def stop(self, signum, frame):
+    def _stop(self, signum, frame):
         """Close socket, flush logs into disk"""
         self.server.close()
         self.flush()
@@ -174,7 +185,7 @@ class LogServer(object):
             self.logs.setdefault(filename, '')
             self.logs[filename] += string + '\n'
             self.count += 1
-            if self.count > self.max_lines:
+            if self.count >= self.max_lines:
                 self.flush()
 
     def flush(self):

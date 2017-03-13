@@ -1,53 +1,40 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python2.7
 
-import unittest, multiprocessing, time, os, shutil, datetime, gzip, random
-from netlog import Server, Client
-import pdb
-d = pdb.set_trace
+import unittest, time, os, shutil, datetime, gzip, random
+from netlog import Logger, LogServer
+
 
 class AppTest(unittest.TestCase):
     def setUp(self):
-        self.path = 'logs'
-        self.port = random.randrange(5000, 6000)
+        self.port = random.randrange(7000, 8000)
+        self.logsdir = 'netlog_test'
         self.date = datetime.datetime.now().date()
         self.date_str = str(self.date)
-        shutil.rmtree(self.path, True)
 
-        # start server
-        def start_server():
-            try:
-                Server(self.path, self.port, max_count=3).start(True)
-            except Exception:
-                pass
-        self.server = multiprocessing.Process(target=start_server)
+        self.server = LogServer(port=self.port, logsdir=self.logsdir,
+                                max_lines=3)
         self.server.start()
+        time.sleep(0.1)
 
     def test_main(self):
+        # sendig messages from client
+        logger = Logger('test0', '127.0.0.1', self.port, False)
+        logger.log('qwe')
+        logger.log('asd')
+        logger.log('zxc')
         time.sleep(0.1)
-        self.assertEqual(os.listdir(self.path), ['netlog_dirs', 'netlog'])
 
-        # send messages from clients
-        client = Client('127.0.0.1', self.port, 'test0')
-        client.send('qwe')
-        client.send('asd')
-        time.sleep(0.1)
-        self.assertEqual(os.listdir(self.path), ['netlog_dirs', 'netlog'])
+        self.assertEqual(
+            os.listdir(os.path.join(self.logsdir, 'test0')), [self.date_str])
 
-        client.send('zxc')
-        time.sleep(0.1)
-        self.assertEqual(os.listdir(self.path),
-                ['netlog_dirs', 'netlog', 'test0'])
-
-        self.assertEqual(os.listdir(os.path.join(self.path, 'test0')),
-                [self.date_str])
-        content = gzip.open(os.path.join(self.path, 'test0',
-                str(self.date))).read()
+        content = gzip.open(os.path.join(self.logsdir, 'test0',
+                self.date_str)).read()
         self.assertEqual(content, 'qwe\nasd\nzxc\n')
 
     def tearDown(self):
-        self.server.terminate()
-        self.server.join()
-        #del self.server
+        self.server.stop()
+        time.sleep(0.1)
+        shutil.rmtree(self.logsdir, True)
 
 
 if __name__ == '__main__':

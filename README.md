@@ -33,7 +33,6 @@ Usage from clients:
 from netlog import Client
 client = Client('127.0.0.1', 5010, 'logname')
 client.send('qwe asd')
-client.send('ert\n dfg')    # may be multiline
 client.close()              # or del client
 ```
 
