@@ -1,243 +1,190 @@
-from SocketServer import ThreadingTCPServer, StreamRequestHandler
-import threading
-import socket
-import time
-from Queue import Queue
 import os
-import datetime
-import gzip
+import sys
+import socket
+import asyncore
 import signal
+import gzip
+from datetime import datetime, timedelta
 
 
-__all__ = ['Server', 'Client']
+__all__ = ['Logger', 'LogServer']
 
 
-class Server(object):
+class Logger(object):
     """
-    server process
-    listen specified port for connections
+    client for logging server
 
     usage:
-        Server('/logs', 5010).start()
+        logger = Logger('127.0.0.1', 5010, 'filename')
+        logger.log('qwe asd')
+
+    :param host: host to connect
+    :param port: port to connect
+    :param filename: file to write
+    :param log_datetime=True: put current datetime to the log
+    """
+
+    DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+    def __init__(self, filename, host, port=7020, log_datetime=True):
+        self.filename = filename
+        self.host = host
+        self.port = port
+        self.log_datetime = log_datetime
+        self._connect()
+
+    def _connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.connect((self.host, self.port))
+        except socket.error:
+            pass    # do nothing if the logging server is not launched
+
+    def log(self, string):
+        """send the string to the logging server"""
+        string = str(string).replace('\n', ' ')     # no \n allowed
+
+        if self.log_datetime:
+            string = '%s %s' % (datetime.now().strftime(
+                                self.DATETIME_FORMAT), string)
+
+        try:
+            self.sock.send('%s %s\n' % (self.filename, string))
+        except socket.error:
+            pass
+
+    def __del__(self):
+        try:
+            self.sock.close()
+        except socket.error:
+            pass
+
+
+class LogServer(object):
+    """
+    server process
+    listens to specified port for connections
+
+    usage:
+        Server('logs', 5010).start()
 
     :param path: directory to save logs
-    :param port: tcp port to listen
-    :param host='0.0.0.0': host for listen
-    :param binary=True: put into .tar.gz file or into plain text file
-    :param max_count=MAX_COUNT: maximum strings in memory before flush to files
-    :param life_time=LIFE_TIME: maximum days before delete log file
-    :param terminator=TERMINATOR: terminator between log strings
+    :param port=7020: tcp port to listen to
+    :param host='0.0.0.0': host to listen to
+    :param archive=True: put into .tar.gz file or into plain text file if False
+        type 'zcat/zmore/zless/zgrep filename.tar.gz' to open an archive
+    :param max_lines=MAX_LINES: maximum amount of lines to keep in memory
+        before flushing them into the disk
+    :param lifetime=LIFETIME: maximum days before deleting old logs
     """
 
     BUF_SIZE = 1024 * 4
-    MAX_COUNT = 1000        # max lines before flush
-    LIFE_TIME = 30          # count of days for save files
     TERMINATOR = '\n'
     debug = False
 
-    class Handler(StreamRequestHandler):
-        def handle(self):
-            self.server._server.handle(self.request)
+    class Server(asyncore.dispatcher):
+        """Listen for connections"""
+        def __init__(self, logserver):
+            asyncore.dispatcher.__init__(self)
+            self.logserver = logserver
+            self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.set_reuse_addr()
+            self.bind((logserver.host, logserver.port))
+            self.listen(5)
 
-    def __init__(self, path, port, host='0.0.0.0', binary=True,
-            max_count=MAX_COUNT, life_time=LIFE_TIME, terminator=TERMINATOR):
-        self.path = path
-        self.port = port
+        def handle_accept(self):
+            pair = self.accept()
+            if pair is not None:
+                sock, addr = pair
+                self.logserver.Handler(sock, self.logserver)
+
+    class Handler(asyncore.dispatcher_with_send):
+        """Request handler"""
+        def __init__(self, sock, logserver):
+            asyncore.dispatcher_with_send.__init__(self, sock)
+            self.logserver = logserver
+            self.buf = ''
+            
+        def handle_read(self):
+            self.buf += self.recv(512)
+            while '\n' in self.buf:
+                line, self.buf = self.buf.split('\n', 1)
+                self.logserver.add(line)
+
+    def __init__(self, host='0.0.0.0', port=7020, logsdir='~/netlog_logs',
+                 archive=True, max_lines=1000, lifetime=30,
+                 pidfile=None):
         self.host = host
-        self.binary = binary
-        self.max_count = max_count
-        self.life_time = life_time
-        self.terminator = terminator
+        self.port = port
+        self.logsdir = os.path.expanduser(logsdir)
+        self.archive = archive
+        self.max_lines = max_lines
+        self.lifetime = lifetime
+        self.pidfile = pidfile or '/var/run/user/%s/netlog.pid' % os.geteuid()
+        self.open = gzip.open if self.archive else open
 
-        self.dirs_file = os.path.join(self.path, 'netlog_dirs')
-        self.open = gzip.open if self.binary else open
-
-    def start(self, debug=False):
-        """
-        start serving
-        :param debug: if True then write self work info into 'netlog' log
-        """
-        if not os.path.exists(self.path):
-            os.makedirs(self.path)
-        if not os.path.exists(self.dirs_file):
-            open(self.dirs_file, 'w')
-
-        self.debug = debug
-        self.debug_log('start on %s %s' % (self.host, self.port))
-
-        self.queue = Queue()
-        self.stopping = threading.Event()
-
+    def start(self, daemon=True):
+        """Start logging daemon"""
+        if daemon:
+            self._become_daemon()
         signal.signal(signal.SIGTERM, self.stop)  # signal 15 (kill)
         signal.signal(signal.SIGINT, self.stop)   # signal 2 (ctrl+c)
 
-        threading.Thread(target=self.flusher).start()
-        threading.Thread(target=self.rotator).start()
+        self.logs = {}
+        self.count = 0
+        self.date = str(datetime.now().date())
+        self.server = self.Server(self)
+        asyncore.loop()
 
-        self.server = ThreadingTCPServer((self.host, self.port), self.Handler)
-        self.server._server = self
-        self.server.serve_forever()
-
-    def handle(self, connection):
-        """work with connection, in dedicated thread"""
-        self.debug_log('connect with %s' % connection)
-        buf = ''
-        logfile = None
-        buf_partial = False
-        while not self.stopping.is_set():
-            # recv data
-            parts = buf.split(' ', 2)
-            if len(parts) < 3 or buf_partial:
-                buf += connection.recv(self.BUF_SIZE)   # blocking
-                buf_partial = False
-                continue
-
-            # parse data
-            self.debug_log('buffer', connection, parts)
-            count, action, buf = parts
-            try:
-                count = int(count)
-            except:
-                print 444, parts
-                assert 0
-            print 222, count, action, len(buf)
-            if len(buf) < count:
-                buf_partial = True
-                print 333
-                continue
-
-            string = buf[:count]
-            buf = buf[count:]
-            if action in ['m', 't']:
-                self.queue.put((logfile, action, string))
-            elif action == 'f':
-                logfile = string
-
-    def flusher(self):
-        """flusher process, flush memory data to logs """
-        logs = {}
-        count = 0
-
-        while True:
-            # wait and get new message
-            log_dir, action, string = self.queue.get()
-            self.debug_log('queue', repr(log_dir), repr(action), repr(string))
-
-            # parse message
-            log = logs.setdefault(log_dir, {})
-            if action == 'm':
-                count += 1
-                log.setdefault('strings', []).append(string)
-            elif action == 't':
-                log['terminator'] = string
-            
-            # flush to files
-            if count >= self.max_count or self.stopping.is_set():
-                self.debug_log('flush', logs.keys())
-                date_str = str(datetime.datetime.now().date())
-                for log_dir, log in logs.items():
-                    path = os.path.join(self.path, log_dir)
-                    if not os.path.exists(path):
-                        os.makedirs(path)
-                    terminator = log.get('terminator', self.terminator)
-                    with self.open(os.path.join(path, date_str), 'a') as f:
-                        f.write(terminator.join(log['strings']))
-                        f.write(terminator)
-                        f.flush()
-
-                # register dirs in rotator
-                reg_logs = open(self.dirs_file).read().split('\n')
-                reg_logs_new = [log for log in reg_logs if os.path.exists(log)]
-                for log in reg_logs:
-                    if log not in reg_logs_new:
-                        reg_logs_new.append(log)
-                if reg_logs_new != reg_logs:
-                    open(self.dirs_file, 'w').write('\n'.join(reg_logs_new))
-
-                logs = {}
-                count = 0
-
-            if self.stopping.is_set():
-                break
-
-    def rotator(self):
-        """rotation process"""
-        date = datetime.datetime.now().date()
-        while not self.stopping.is_set():
-            time.sleep(0.1)
-            cur_date = datetime.datetime.now().date()
-
-            if date != cur_date:
-                logs = open(self.dirs_file).read().split('\n')
-                self.debug_log('rotate:', logs)
-
-                date_str = str(date)
-                cur_date_str = str(cur_date)
-                del_date_str = str(cur_date - datetime.timedelta(
-                        days=self.life_time))
-
-                for log in logs:
-                    logfile_src = os.path.join(log, date_str)
-                    logfile_dst = os.path.join(log, cur_date_str)
-                    logfile_del = os.path.join(log, del_date_str)
-                    if os.path.exists(logfile_src):
-                        os.move(logfile_src, logfile_dst)
-                    if os.path.exists(logfile_del):
-                        os.remove(logfile_del)
-
-                self.date = datetime.now().date()
+    def _become_daemon(self):
+        #if os.fork() > 0: sys.exit()
+        #if os.fork() > 0: sys.exit()
+        try:
+            old_pid = int(open(self.pidfile).read())
+            os.getpgid(old_pid)
+            raise Exception('Logger daemon is already running with pid %d!'
+                            % old_pid)
+        except (OSError, IOError):
+            pass
+        with open(self.pidfile, 'w') as f:
+            f.write(str(os.getpid()))
 
     def stop(self, signum, frame):
-        self.debug_log('stopping')
-        self.stopping.set()
-        del self.server
-        self.debug_log('stopped, seeya!')
+        """Close socket, flush logs into disk"""
+        self.server.close()
+        self.flush()
+        os.remove(self.pidfile)
+        sys.exit()
 
-    def debug_log(self, *strings):
-        """print self log strings"""
-        if self.debug:
-            string = ' '.join(map(str, strings))
-            self.open(os.path.join(self.path, 'netlog'), 'a')\
-                    .write('%s\n' % string)
+    def add(self, line):
+        """Add new line into buffer"""
+        if self.count % 100 == 0 and self.date != str(datetime.now().date()):
+            self.flush()
+            for logfile in self.logs:
+                # removing old logs
+                for_del_log = os.path.join(self.logsdir, logfile,
+                        str((datetime.now()-timedelta(days=self.lifetime)).date()))
+                if os.path.exists(for_del_log):
+                    os.remove(for_del_log)
 
+            self.date = str(datetime.now().date())
 
-class Client(object):
-    """
-    client for logger server
+        if line:
+            filename, string = line.split(' ', 1)
+            self.logs.setdefault(filename, '')
+            self.logs[filename] += string + '\n'
+            self.count += 1
+            if self.count > self.max_lines:
+                self.flush()
 
-    usage:
-        client = Client('127.0.0.1', 5010, 'filename')
-        client.send('qwe asd')
+    def flush(self):
+        """Write logs into disk"""
+        for filename in self.logs.keys():
+            logdir = os.path.join(self.logsdir, filename)
+            if not os.path.exists(logdir):
+                os.makedirs(logdir)
+            self.open(os.path.join(logdir, self.date), 'a').write(
+                      self.logs[filename])
+            del self.logs[filename]
 
-        client.set_terminator('\n----------\n\n')
-        client.send('rty\n fgh')
-
-    :param port: port to connect
-    :param host: host to connect
-    :param filename: file to write
-    """
-    def __init__(self, port, host, filename):
-        self.sock = socket.socket()
-        self.sock.connect((port, host))
-        self.set_filename(filename)
-
-    def set_filename(self, filename):
-        """set name of file or dir to write log strings"""
-        self.send('f %s' % filename, True)
-
-    def set_terminator(self, terminator):
-        """set string, which will be between log strings"""
-        self.send('t %s' % terminator, True)
-
-    def send(self, string, control=False):
-        """send string to server for write to log file"""
-        if not control:
-            string = 'm %s' % string
-        string = '%d %s' % (len(string)-2, string)
-        self.sock.send(string)
-
-    def close(self):
-        self.sock.close()
-
-    def __del__(self):
-        self.close()
+        self.count = 0
